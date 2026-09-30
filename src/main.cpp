@@ -117,6 +117,10 @@ struct __attribute__((packed)) WioSmokeStatus {
     float    smokeIndex;     // IR - baseline (>= 0)
     float    redIrRatio;     // RED / IR
     float    tempC;          // die temperature
+    // Appended at the end so older Main firmware (length-tolerant memcpy) still
+    // parses the legacy fields. ZE730 CO piggybacks on this packet.
+    float    coPpm;          // CO ppm, -1 => no ZE730 / no reading (indoor only)
+    uint8_t  coOnline;       // 1 => ZE730 producing fresh frames
 };
 
 // Latest telemetry pushed from the main node; buildTelemetryFrame() reads these.
@@ -455,6 +459,16 @@ static void setupMax30105()
     maxReady = true;
 }
 
+// ── ZE730-CO state (declared here so serviceMax30105 can piggyback CO on the
+// WIO_STATUS packet; the setup/service functions are defined further below) ──
+static HardwareSerial ZE730Serial(2);
+static bool     ze730Ready     = false;   // set once a valid frame is decoded
+static bool     ze730Online    = false;   // valid frame within the staleness window
+static float    lastCoPpm      = -1.0f;    // -1 => no reading yet (frame sentinel)
+static uint32_t lastCoMs       = 0;
+static uint16_t ze730FullRange = 0;
+static const uint32_t ZE730_STALE_MS = 8000; // ~8 missed 1Hz frames => sensor gone
+
 // Poll once per second: compute the rolling clean-air baseline, smoke index, and
 // RED/IR ratio, latch a sustained rise as smoke, track calibration warmup, print
 // locally, and report status to the main node over UART (sender role only).
@@ -470,6 +484,8 @@ static void serviceMax30105()
             WioSmokeStatus s;
             memset(&s, 0, sizeof(s));
             s.calTarget = MAX_CAL_WARMUP_READS;
+            s.coPpm    = ze730Online ? lastCoPpm : -1.0f;
+            s.coOnline = ze730Online ? 1 : 0;
             uartSendPacket(DeviceUART, WIO_STATUS, (uint8_t *)&s, sizeof(s));
         }
         return;
@@ -556,6 +572,8 @@ static void serviceMax30105()
         s.smokeIndex     = smokeIndex;
         s.redIrRatio     = redIrRatio;
         s.tempC          = tempC;
+        s.coPpm          = ze730Online ? lastCoPpm : -1.0f;
+        s.coOnline       = ze730Online ? 1 : 0;
         uartSendPacket(DeviceUART, WIO_STATUS, (uint8_t *)&s, sizeof(s));
     }
 #endif
@@ -573,14 +591,8 @@ static void serviceMax30105()
 // outdoor flag needed, and a mid-life disconnect self-heals by dropping the field.
 #define PIN_ZE730_RX 44   // D7  <- ZE730 TXD
 #define PIN_ZE730_TX 43   // D6  -> ZE730 RXD
-static HardwareSerial ZE730Serial(2);
-
-static bool     ze730Ready     = false;   // set once a valid frame is decoded
-static bool     ze730Online    = false;   // valid frame within the staleness window
-static float    lastCoPpm      = -1.0f;    // -1 => no reading yet (frame sentinel)
-static uint32_t lastCoMs       = 0;
-static uint16_t ze730FullRange = 0;
-static const uint32_t ZE730_STALE_MS = 8000; // ~8 missed 1Hz frames => sensor gone
+// ZE730 state (ZE730Serial, ze730Online, lastCoPpm, ...) is declared earlier,
+// above serviceMax30105, so that function can fold CO into the WIO_STATUS packet.
 
 // Bring up UART2 and nudge the module into active-upload mode. Some units ship
 // in Q&A (silent-until-polled) mode; the 0x78/0x40 command forces streaming.
