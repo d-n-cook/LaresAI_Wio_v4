@@ -379,6 +379,11 @@ static const uint8_t SYNC_WORD = 0x34;
 static const int8_t TX_POWER_DBM = 22; // SX1262 max
 static const float TCXO_VOLTAGE = 1.8;
 
+// Sender TX-error recovery: after this many consecutive radio.transmit() failures
+// the radio is fully reset + re-initialised to unwedge a chip that has stopped
+// answering SPI commands (TX_TIMEOUT / SPI_CMD_FAILED).
+static const uint8_t TX_ERR_RECOVER_THRESHOLD = 3;
+
 // Module(cs, irq/dio1, reset, busy)
 SX1262 radio = new Module(PIN_LORA_CS, PIN_LORA_DIO1, PIN_LORA_RESET, PIN_LORA_BUSY);
 
@@ -689,6 +694,56 @@ static void halt(const char *what, int code)
     }
 }
 
+// Human-readable name for the RadioLib status codes we actually see here, so the
+// serial log says what failed instead of just a bare negative number.
+static const char *radioErrName(int code)
+{
+    switch (code) {
+        case RADIOLIB_ERR_NONE:            return "NONE";
+        case RADIOLIB_ERR_TX_TIMEOUT:      return "TX_TIMEOUT";
+        case RADIOLIB_ERR_SPI_CMD_TIMEOUT: return "SPI_CMD_TIMEOUT";
+        case RADIOLIB_ERR_SPI_CMD_INVALID: return "SPI_CMD_INVALID";
+        case RADIOLIB_ERR_SPI_CMD_FAILED:  return "SPI_CMD_FAILED";
+        case RADIOLIB_ERR_CHIP_NOT_FOUND:  return "CHIP_NOT_FOUND";
+        case RADIOLIB_ERR_PACKET_TOO_LONG: return "PACKET_TOO_LONG";
+        default:                           return "?";
+    }
+}
+
+// Full (re)initialisation of the SX1262: radio.begin() plus the board-specific
+// TCXO (DIO3) and RF-switch (DIO2) config, which a reset clears. Returns
+// RADIOLIB_ERR_NONE on success. Used at boot and by the TX-error recovery path.
+static int initRadio()
+{
+    int st = radio.begin(FREQUENCY_MHZ, BANDWIDTH_KHZ, SPREADING_FACTOR, CODING_RATE, SYNC_WORD, TX_POWER_DBM);
+    if (st != RADIOLIB_ERR_NONE)
+        return st;
+    int tcxo = radio.setTCXO(TCXO_VOLTAGE);
+    if (tcxo != RADIOLIB_ERR_NONE)
+        Serial.printf("[LoRa] setTCXO warn %d (%s)\n", tcxo, radioErrName(tcxo));
+    radio.setDio2AsRfSwitch(true);
+    return RADIOLIB_ERR_NONE;
+}
+
+// Attempt to resurrect a wedged SX1262: hard reset, re-init, re-apply config.
+// On this board a stuck BUSY line or a brownout mid-TX leaves the chip ignoring
+// SPI commands; a plain standby() will not clear that, but a reset does.
+static bool __attribute__((unused)) recoverRadio()
+{
+    Serial.printf("[LoRa] recovering radio: reset + re-init (BUSY=%d)...\n",
+                  digitalRead(PIN_LORA_BUSY));
+    radio.reset();
+    delay(10);
+    int st = initRadio();
+    if (st == RADIOLIB_ERR_NONE) {
+        Serial.println("[LoRa] recovery OK — radio re-initialised");
+        return true;
+    }
+    Serial.printf("[LoRa] recovery FAILED %d (%s)  BUSY=%d\n",
+                  st, radioErrName(st), digitalRead(PIN_LORA_BUSY));
+    return false;
+}
+
 #if NODE_ROLE != 0
 // Set by the DIO1 ISR when a full packet has been received.
 static volatile bool rxReady = false;
@@ -743,13 +798,12 @@ void setup()
 
     SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_CS);
 
-    int st = radio.begin(FREQUENCY_MHZ, BANDWIDTH_KHZ, SPREADING_FACTOR, CODING_RATE, SYNC_WORD, TX_POWER_DBM);
+    // initRadio() does radio.begin() + the board-specific TCXO/RF-switch config.
+    int st = initRadio();
     if (st != RADIOLIB_ERR_NONE)
         halt("radio.begin", st);
-
-    // Board-specific: TCXO on DIO3, RF switch on DIO2. Both are required here.
-    radio.setTCXO(TCXO_VOLTAGE);
-    radio.setDio2AsRfSwitch(true);
+    Serial.printf("[LoRa] init OK @ %.1f MHz, TX power %d dBm (BUSY=%d)\n",
+                  FREQUENCY_MHZ, TX_POWER_DBM, digitalRead(PIN_LORA_BUSY));
 
     setupMax30105();
     setupZE730();
@@ -815,6 +869,7 @@ void loop()
 {
     static uint32_t seq = 0;
     static uint32_t nextTxMs = 0; // 0 => transmit immediately on first pass
+    static uint8_t  txErrStreak = 0; // consecutive radio.transmit() failures
 
     // Keep the credential handshake alive every pass (non-blocking): retry HELLO,
     // accept/persist UART creds, and apply fallbacks on their timers.
@@ -845,8 +900,22 @@ void loop()
     Serial.printf("TX #%lu: %s ... ", (unsigned long)seq, frame);
     int st = radio.transmit(frame);
     Serial.println(st == RADIOLIB_ERR_NONE ? "ok" : "ERR");
-    if (st != RADIOLIB_ERR_NONE)
-        Serial.printf("  transmit err %d\n", st);
+    if (st != RADIOLIB_ERR_NONE) {
+        if (txErrStreak < 255)
+            txErrStreak++;
+        Serial.printf("  transmit err %d (%s)  BUSY=%d  heap=%lu  streak=%u\n",
+                      st, radioErrName(st), digitalRead(PIN_LORA_BUSY),
+                      (unsigned long)ESP.getFreeHeap(), txErrStreak);
+        // Put the chip back into a known state; after repeated failures do a full
+        // reset + re-init to unwedge a radio that has stopped answering SPI.
+        radio.standby();
+        if (txErrStreak >= TX_ERR_RECOVER_THRESHOLD && recoverRadio())
+            txErrStreak = 0;
+    } else {
+        if (txErrStreak)
+            Serial.printf("  TX recovered after %u error(s)\n", txErrStreak);
+        txErrStreak = 0;
+    }
 
     seq++;
 
