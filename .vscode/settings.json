@@ -1,0 +1,7 @@
+{
+    // Native-USB ESP32-S3 boards re-enumerate to a new COM number on every reset,
+    // leaving phantom ports behind. Never pin a number: null = auto-detect the
+    // board by its USB ID (303A:1001) so Upload/Monitor always find the live port.
+    "platformio-ide.customPCPort": null,
+    "platformio-ide.customPCPortMonitor": null
+}
